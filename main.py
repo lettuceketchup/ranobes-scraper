@@ -177,9 +177,12 @@ def safe_page_content(page, attempts=5, delay=0.5):
 
 class BrowserSession:
     # The site fronts every request with a Cloudflare Turnstile bot check that
-    # a plain HTTP client can never pass (it needs JS + a canvas fingerprint).
-    # A real (even headless) browser clears it automatically, so we drive one
-    # persistent browser session for every page fetch instead of urllib/requests.
+    # a plain HTTP client can never pass (it needs JS + a canvas fingerprint),
+    # so we drive one persistent browser session for every page fetch instead
+    # of urllib/requests. A headless browser often clears that check on its
+    # own, but not always: as of 2026-11 the site sometimes serves its own
+    # image CAPTCHA ("click on the similar image") on the very first request,
+    # which only a human in a visible window can solve (see handle_anti_flood).
 
     def __init__(self, timeout_ms=30000, wait_ms=1500):
         self.timeout_ms = timeout_ms

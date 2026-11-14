@@ -29,6 +29,8 @@ python -m playwright install chromium
 
 The second command is a one-time download of the Chromium browser the script drives — the site can't be scraped with plain HTTP requests, since it fronts every page with a bot check that needs a real browser to clear.
 
+You also need a graphical desktop (a screen the script can open a browser window on), because the site may ask you to solve a CAPTCHA by hand — see [Anti-flood / CAPTCHA handling](#anti-flood--captcha-handling). The final "Save As" dialog needs one too.
+
 ### Usage
 
 Navigate to the project folder and run
@@ -80,7 +82,9 @@ Run `python main.py --help` for the full list, including:
 
 ### Anti-flood / CAPTCHA handling
 
-Under sustained request volume, Ranobes' anti-bot protection can escalate to a real interactive CAPTCHA that no script can solve on its own. When that happens, the script automatically opens a visible browser window (the same session, so your cookies carry over) for you to solve it — just complete the check and press Enter in the terminal to continue. It'll also print the URL in case the window doesn't pop up for some reason.
+Ranobes' anti-bot protection can escalate to a real interactive CAPTCHA that no script can solve on its own. This usually happens under sustained request volume, but it can also happen on the very first page: in a November 2026 test from an Android phone (Termux), the site served its own image CAPTCHA ("click on the similar image") right away, and waiting didn't clear it. When that happens, the script automatically opens a visible browser window (the same session, so your cookies carry over) for you to solve it — just complete the check and press Enter in the terminal to continue. It'll also print the URL in case the window doesn't pop up for some reason.
+
+If no window can be opened at all (for example over SSH, in a container, or in Termux without an X11/VNC display), the script stops with a message saying so instead of crashing. Re-run it on a machine with a desktop to solve the CAPTCHA.
 
 If a page keeps failing after several retries for another reason (bad connection, site hiccup, etc.), the script stops and asks whether to retry, skip that item, or abort — it never silently gives up on a chapter. If you abort or interrupt the run (Ctrl+C) partway through, it'll offer to save an epub with whatever chapters were already fetched, rather than losing that work.
 

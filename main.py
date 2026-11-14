@@ -216,7 +216,14 @@ class BrowserSession:
     def switch_to_headed(self, url):
         state = self.context.storage_state()
         self.browser.close()
-        self._launch(headless=False, storage_state=state)
+        try:
+            self._launch(headless=False, storage_state=state)
+        except PlaywrightError:
+            # A visible window can't open here (e.g. no display). Put the
+            # headless browser back so the session stays usable and close()
+            # still has a browser to shut down, then let the caller decide.
+            self._launch(headless=True, storage_state=state)
+            raise
         self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         try:
             self.page.bring_to_front()
@@ -273,10 +280,27 @@ def safe_input(prompt):
         return None
 
 
+def headed_launch_failure_message(e):
+    no_display = (sys.platform.startswith("linux")
+                  and not os.environ.get("DISPLAY")
+                  and not os.environ.get("WAYLAND_DISPLAY"))
+    if no_display:
+        reason = ("there is no graphical display here (DISPLAY/WAYLAND_DISPLAY "
+                  "are unset), so no browser window can open")
+    else:
+        reason = f"the browser failed to launch: {str(e).splitlines()[0]}"
+    return ("The site wants a human to solve a verification, but a visible browser "
+            f"window couldn't be opened - {reason}. Re-run on a machine with a "
+            "display (or set one up here) to solve it.")
+
+
 def handle_anti_flood(session, blocked_url):
     logging.warning("Anti-flood protection triggered by the site.")
     print(f"If a browser window doesn't appear, open this URL manually: {blocked_url}")
-    session.switch_to_headed(blocked_url)
+    try:
+        session.switch_to_headed(blocked_url)
+    except PlaywrightError as e:
+        raise RunAborted(headed_launch_failure_message(e)) from None
     try:
         while True:
             response = safe_input(

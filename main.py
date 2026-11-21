@@ -1,6 +1,7 @@
 # Importing necessary libraries
 import argparse
 import ast
+import contextlib
 import hashlib
 import io
 import json
@@ -9,12 +10,14 @@ import math
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from html import escape
+import tkinter as tk
 from tkinter.filedialog import asksaveasfile
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -31,8 +34,27 @@ import pdfkit
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-# Nunito Sans Font
-FONT = "<link href='https://fonts.googleapis.com/css?family=Nunito Sans' rel='stylesheet'>"
+# One shared stylesheet for the whole book. Deliberately no font-family or
+# line-height: the reader's own font/size/spacing settings then apply (inline
+# styles would override them, and a Google Fonts <link> can't load offline).
+BOOK_CSS = """\
+h1, h2 { margin: 1em 0 .8em 0; }
+p { margin: 0 0 1em 0; }
+p.scene { text-align: center; margin: 1.6em 0; }
+.footnotes { margin-top: 2em; padding-top: .8em; border-top: 1px solid #999; font-size: .85em; }
+.footnotes-title { font-weight: bold; }
+.comments { margin-top: 2em; padding-top: 1em; border-top: 2px solid #ccc; }
+.comment { margin: 10px 0; padding: 8px 12px; border-left: 2px solid #ccc; }
+.comment-author { font-weight: bold; }
+.comment-meta { font-size: .8em; color: #888; }
+.comment-reply { font-size: .85em; color: #888; }
+.comment-body { margin-top: 4px; }
+.comments-more { font-size: .85em; color: #888; font-style: italic; }
+.intro h1 { margin-bottom: .1em; }
+"""
+BOOK_CSS_PATH = "style/book.css"
+
+DEFAULT_MAX_COMMENTS = 20
 
 CAPTCHA_MARKERS = (
     "checking your browser",
@@ -71,6 +93,67 @@ def sanitize_filename(name, max_length=150):
 
 class RunAborted(Exception):
     """Raised when a human explicitly chooses to abort the run."""
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+C handling
+# ---------------------------------------------------------------------------
+# A KeyboardInterrupt raised *inside* a Playwright call leaves its event loop
+# half-finished, and the next Playwright call (e.g. saving cookies while
+# shutting down) then hangs; more Ctrl+C presses just add "Task was destroyed
+# but it is pending" noise. So the first Ctrl+C only sets a flag that the run
+# checks at safe points between pages (check_stop), and a second one quits at
+# once. At an input() prompt nothing is in flight, so there Ctrl+C is a plain
+# KeyboardInterrupt (see interruptible).
+
+_stop_requested = False
+
+
+def _on_sigint(signum, frame):
+    global _stop_requested
+    if _stop_requested:
+        sys.stderr.write("\nCtrl+C again: quitting immediately.\n")
+        sys.stderr.flush()
+        os._exit(130)
+    _stop_requested = True
+    sys.stderr.write("\nCtrl+C: stopping after the current page "
+                     "(press Ctrl+C again to quit immediately)...\n")
+    sys.stderr.flush()
+
+
+def install_sigint_handler():
+    global _stop_requested
+    _stop_requested = False
+    signal.signal(signal.SIGINT, _on_sigint)
+
+
+def check_stop():
+    if _stop_requested:
+        raise KeyboardInterrupt
+
+
+def stoppable_sleep(seconds):
+    end = time.monotonic() + seconds
+    while True:
+        check_stop()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.2, left))
+
+
+@contextlib.contextmanager
+def interruptible():
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def ask(prompt):
+    with interruptible():
+        return input(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +454,7 @@ def safe_input(prompt):
     """input() that degrades to None (instead of crashing) if no stdin is
     available - e.g. the script is ever run non-interactively."""
     try:
-        return input(prompt)
+        return ask(prompt)
     except EOFError:
         return None
 
@@ -447,8 +530,8 @@ def read_line_with_timeout(seconds):
     try:
         ready, _, _ = select.select([sys.stdin], [], [], seconds)
     except (OSError, ValueError):
-        # stdin isn't selectable (unusual) - just wait out the poll interval.
-        time.sleep(seconds)
+        # stdin isn't selectable (e.g. Windows) - just wait out the poll interval.
+        stoppable_sleep(seconds)
         return None
     if not ready:
         return None
@@ -481,6 +564,7 @@ def wait_for_captcha_cleared(session, captcha_timeout=None):
     deadline = (time.monotonic() + captcha_timeout * 60) if captcha_timeout else None
     clear_streak = 0
     while True:
+        check_stop()
         if session.window_closed():
             raise RunAborted("The CAPTCHA window was closed")
         if deadline is not None and time.monotonic() >= deadline:
@@ -561,6 +645,7 @@ def fetch_with_retry(session, url, args, *, label, progress_bar=None):
 
     attempt = 0
     while True:
+        check_stop()
         try:
             soup = session.fetch_soup(url)
         except KeyboardInterrupt:
@@ -579,7 +664,7 @@ def fetch_with_retry(session, url, args, *, label, progress_bar=None):
                     logging.warning(f"Skipping {label} at user's request.")
                     return None
                 raise RunAborted(f"Aborted while fetching {label}")
-            time.sleep(args.retry_delay)
+            stoppable_sleep(args.retry_delay)
             continue
 
         if is_anti_flood_blocked(soup):
@@ -588,7 +673,7 @@ def fetch_with_retry(session, url, args, *, label, progress_bar=None):
             continue
 
         if args.request_delay:
-            time.sleep(args.request_delay)
+            stoppable_sleep(args.request_delay)
         # Only cache confirmed-good content - never a CAPTCHA/challenge page.
         args.cache.set(url, soup)
         return soup
@@ -764,8 +849,8 @@ def build_intro_html(metadata):
     synopsis = "".join(
         f'<p style="margin:0 0 1em 0">{escape(p)}</p>' for p in metadata.description_paragraphs)
 
-    return f'''{FONT}<div style="font-family:'Nunito Sans'; padding:0 10px; line-height:1.6">
-        <h1 style="margin-bottom:.1em">{escape(metadata.title)}</h1>
+    return f'''<div class="intro">
+        <h1>{escape(metadata.title)}</h1>
         <table style="margin:1em 0 1.5em 0;border-collapse:collapse">{facts}</table>
         {'<h2>Synopsis</h2>' + synopsis if synopsis else ''}
     </div>'''
@@ -802,7 +887,7 @@ def _sanitize_node(node):
             parts.append(escape(str(child)))
         elif isinstance(child, Tag):
             if child.name == "br":
-                parts.append("<br>")
+                parts.append("<br/>")
             elif "quote" in (child.get("class") or []):
                 inner = _sanitize_node(child).strip()
                 if inner:
@@ -895,32 +980,252 @@ def render_comments_html(comments, depth=0):
     indent_px = min(depth, MAX_COMMENT_INDENT_DEPTH) * 18
     parts = []
     for c in comments:
-        reply_line = (f'<div style="font-size:.85em;color:#888">'
+        reply_line = (f'<div class="comment-reply">'
                        f'&#8618; replying to {escape(c.reply_to)}</div>') if c.reply_to else ""
         parts.append(f'''
-            <div style="margin:10px 0 10px {indent_px}px;padding:8px 12px;
-                        border-left:2px solid #ccc;">
-                <div style="font-weight:bold">{escape(c.author)}</div>
-                <div style="font-size:.8em;color:#888">
-                    {escape(_format_timestamp(c.timestamp))} &middot; +{escape(c.upvotes)}/-{escape(c.downvotes)}
+            <div class="comment" style="margin-left:{indent_px}px">
+                <div class="comment-author">{escape(c.author)}</div>
+                <div class="comment-meta">
+                    {escape(_format_timestamp(c.timestamp))} &#183; +{escape(c.upvotes)}/-{escape(c.downvotes)}
                 </div>
                 {reply_line}
-                <div style="margin-top:4px">{c.body_html}</div>
+                <div class="comment-body">{c.body_html}</div>
             </div>''')
         if c.replies:
             parts.append(render_comments_html(c.replies, depth + 1))
     return "".join(parts)
 
 
-def build_comments_section(comments):
+def build_comments_section(comments, hidden=0):
     if not comments:
         return ""
     body = render_comments_html(comments)
-    return f'''{FONT}<div style="margin-top:2em;padding-top:1em;border-top:2px solid #ccc;
-                font-family:'Nunito Sans';line-height:1.6">
-        <h2 style="font-family:'Nunito Sans'">Comments</h2>
+    more = (f'<p class="comments-more">{hidden} more comment'
+            f'{"s" if hidden != 1 else ""} not shown.</p>') if hidden else ""
+    return f'''<div class="comments">
+        <h2>Comments</h2>
         {body}
+        {more}
     </div>'''
+
+
+def _vote_count(text):
+    match = re.search(r"-?\d+", text or "")
+    return int(match.group()) if match else 0
+
+
+def _comment_count(node):
+    return 1 + sum(_comment_count(r) for r in node.replies)
+
+
+def _thread_score(node):
+    return (_vote_count(node.upvotes) - _vote_count(node.downvotes)
+            + sum(_thread_score(r) for r in node.replies))
+
+
+def _trim_thread(node, budget):
+    # Keep the root plus as many replies (depth-first, in order) as fit.
+    kept = replace(node, replies=[])
+    budget -= 1
+    for reply in node.replies:
+        if budget <= 0:
+            break
+        sub = _trim_thread(reply, budget)
+        kept.replies.append(sub)
+        budget -= _comment_count(sub)
+    return kept
+
+
+def limit_comments(comments, max_comments):
+    # Cap the comments shown per chapter so a popular chapter can't bury the
+    # next one. Threads are ranked by their summed net votes (ties keep site
+    # order); whole threads are taken until the budget runs out, the last one
+    # trimmed to fit, and the survivors go back in their original order.
+    # Returns (kept comments, number hidden). max_comments <= 0 means no cap.
+    total = sum(_comment_count(c) for c in comments)
+    if max_comments <= 0 or total <= max_comments:
+        return comments, 0
+    ranked = sorted(range(len(comments)), key=lambda i: (-_thread_score(comments[i]), i))
+    kept, budget = {}, max_comments
+    for i in ranked:
+        if budget <= 0:
+            break
+        node = comments[i]
+        thread = node if _comment_count(node) <= budget else _trim_thread(node, budget)
+        kept[i] = thread
+        budget -= _comment_count(thread)
+    result = [kept[i] for i in sorted(kept)]
+    return result, total - sum(_comment_count(c) for c in result)
+
+
+# ---------------------------------------------------------------------------
+# Chapter content: cleaning, footnotes, scene breaks
+# ---------------------------------------------------------------------------
+
+# Translator-group promo lines. Matched on the whole paragraph's shape, never
+# on the word "discord": a translator's note that mentions the Discord server
+# in prose must survive. Translator:/Editor: credit lines are kept on purpose.
+_PROMO_PATTERNS = [
+    re.compile(r"^(?:(?:discord|join our discord(?: at)?)\s*:?\s*)?https?://"
+               r"(?:dsc\.gg|discord\.gg|discord\.com/invite)/\S*$", re.I),
+    re.compile(r"^(?:discord|join our discord(?: at)?)\s*:?$", re.I),
+]
+_SCENE_BREAK = re.compile(r"^[\s*─-╿—–\-=~_•·⁂#]{3,}$")
+_FOOTNOTE_HEADING = re.compile(r"^footnotes?:?$", re.I)
+_FOOTNOTE_ITEM = re.compile(r"^\[(\d+)\]\s*")
+_NOTE_MARKER = re.compile(r"\[(\d+)\]")
+_SKIPPED_TAGS = {"script", "style", "iframe", "ins", "noscript"}
+HEADER_BLOCKS = 8  # the site's own "Chapter N" echo only appears this early
+
+
+@dataclass
+class ChapterContent:
+    label: str
+    html: str
+    words: int
+    removed: int
+
+
+def _normalize_quotes(text):
+    return text.replace("’", "'").replace("‘", "'")
+
+
+def _inline_html(node):
+    # Safe subset for chapter text: keep text, <em>, <strong> and <br/>; every
+    # other tag is dropped but its text kept (ads/scripts are dropped whole).
+    parts = []
+    for child in node.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            parts.append(escape(str(child), quote=False))
+        elif isinstance(child, Tag):
+            if child.name == "br":
+                parts.append("<br/>")
+            elif child.name in _SKIPPED_TAGS:
+                continue
+            else:
+                inner = _inline_html(child)
+                if child.name in ("em", "i") and inner.strip():
+                    parts.append(f"<em>{inner}</em>")
+                elif child.name in ("strong", "b") and inner.strip():
+                    parts.append(f"<strong>{inner}</strong>")
+                else:
+                    parts.append(inner)
+    return "".join(parts)
+
+
+def _chapter_blocks(box):
+    # (kind, html, text) in reading order; kind is "p" or "scene".
+    blocks = []
+    for el in box.find_all(["p", "hr"]):
+        if el.name == "hr":
+            blocks.append(("scene", "", ""))
+            continue
+        text = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+        if not text:
+            continue
+        if _SCENE_BREAK.match(text):
+            blocks.append(("scene", "", ""))
+            continue
+        html = re.sub(r"\s+", " ", _inline_html(el)).strip()
+        blocks.append(("p", html, text))
+    return blocks
+
+
+def _split_footnotes(blocks):
+    # A trailing "Footnotes:" paragraph followed by "[n] ..." paragraphs. The
+    # site's template also leaves an empty "Footnotes:" heading (nothing after
+    # it) or a stub "[1]" with no text on chapters that have none; both are
+    # consumed and dropped rather than shown as an empty footnote.
+    for i, (kind, _, text) in enumerate(blocks):
+        if kind == "p" and _FOOTNOTE_HEADING.match(text):
+            notes, j = [], i + 1
+            while j < len(blocks) and blocks[j][0] == "p":
+                m = _FOOTNOTE_ITEM.match(blocks[j][2])
+                if not m:
+                    break
+                body = _FOOTNOTE_ITEM.sub("", blocks[j][1], count=1)
+                if body.strip():
+                    notes.append((int(m.group(1)), body))
+                j += 1
+            if j > i + 1 or i == len(blocks) - 1:
+                return blocks[:i], notes, blocks[j:]
+    return blocks, [], []
+
+
+def _tidy_scene_breaks(blocks):
+    # One break at a time, none at the very start or end.
+    out = []
+    for block in blocks:
+        if block[0] == "scene" and (not out or out[-1][0] == "scene"):
+            continue
+        out.append(block)
+    while out and out[-1][0] == "scene":
+        out.pop()
+    return out
+
+
+def build_chapter_content(site_soup, novel_title, fallback_label):
+    h1 = site_soup.find("h1", class_="h4 title")
+    raw = h1.get_text(" ", strip=True) if h1 is not None else ""
+    match = re.search(r"Chapter\s+\d+(?:\.\d+)?", raw, re.I)
+    # Non-chapter pages (e.g. "Announcement | <novel title>") keep just the part
+    # before the "|".
+    label = (re.sub(r"\s+", " ", match.group(0)) if match
+             else (raw.split("|")[0].strip() or fallback_label))
+
+    box = site_soup.find(id="arrticle")
+    if box is None:
+        logging.warning(f"{label}: chapter text container not found; using the whole page.")
+        box = site_soup
+
+    title_norm = _normalize_quotes(novel_title).casefold()
+    kept, removed = [], 0
+    for idx, block in enumerate(_chapter_blocks(box)):
+        kind, _, text = block
+        if kind == "p":
+            is_promo = any(p.match(text) for p in _PROMO_PATTERNS)
+            is_banner = (text.startswith("◈") and title_norm
+                         and title_norm in _normalize_quotes(text).casefold())
+            is_echo = idx < HEADER_BLOCKS and text == label
+            if is_promo or is_banner or is_echo:
+                removed += 1
+                continue
+        kept.append(block)
+
+    body, notes, tail = _split_footnotes(kept)
+    body, tail = _tidy_scene_breaks(body), _tidy_scene_breaks(tail)
+
+    note_ids = {n for n, _ in notes}
+    linked = set()
+
+    def link_marker(m):
+        n = int(m.group(1))
+        if n not in note_ids:
+            return m.group(0)
+        id_attr = "" if n in linked else f' id="fnref{n}"'
+        linked.add(n)
+        return f'<a epub:type="noteref" href="#fn{n}"{id_attr}>[{n}]</a>'
+
+    def render(block, link=False):
+        kind, html, _ = block
+        if kind == "scene":
+            return '<p class="scene">* * *</p>'
+        return f"<p>{_NOTE_MARKER.sub(link_marker, html) if link else html}</p>"
+
+    parts = [f"<h2>{escape(label)}</h2>"]
+    parts += [render(b, link=True) for b in body]
+    if notes:
+        parts.append('<div class="footnotes"><p class="footnotes-title">Footnotes</p>')
+        for n, html in notes:
+            ref = f'<a href="#fnref{n}">[{n}]</a>' if n in linked else f"[{n}]"
+            parts.append(f'<aside epub:type="footnote" id="fn{n}"><p>{ref} {html}</p></aside>')
+        parts.append("</div>")
+    parts += [render(b) for b in tail]
+
+    words = sum(len(text.split()) for kind, _, text in body + tail if kind == "p")
+    return ChapterContent(label=label, html="\n".join(parts), words=words, removed=removed)
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +1250,11 @@ def parse_args():
     comments_group.add_argument(
         "--no-comments", dest="comments", action="store_false",
         help="Do not include reader comments (default)")
+    parser.add_argument(
+        "--max-comments", type=int, default=DEFAULT_MAX_COMMENTS, metavar="N",
+        help="With --comments, show at most N comments per chapter (replies "
+             "count), keeping the best-voted threads; 0 = no limit "
+             f"(default: {DEFAULT_MAX_COMMENTS})")
 
     parser.add_argument(
         "--retries", type=int, default=5,
@@ -1004,25 +1314,29 @@ def parse_args():
              "indefinitely)")
     parser.add_argument(
         "--output-dir", default=DEFAULT_OUTPUT_DIR,
-        help="Directory the save dialog opens in by default, pre-filled with "
-             f"a name based on the novel title and chapter range (default: "
-             f"{DEFAULT_OUTPUT_DIR})")
+        help="Folder the .epub is written to, named from the novel title and "
+             "chapter range; an existing file is never overwritten, a number "
+             f"is added instead (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument(
+        "--save-dialog", action="store_true",
+        help="Ask where to save with a Save As window instead of writing "
+             "straight to --output-dir (needs a desktop)")
     return parser.parse_args()
 
 
 def resolve_interactive(args):
     if not args.url:
-        args.url = input("Enter URL : ").strip()
+        args.url = ask("Enter URL : ").strip()
     return args
 
 
 def resolve_chapter_range(args, count):
     if args.start is None:
-        args.start = int(input("Enter starting chapter number : "))
+        args.start = int(ask("Enter starting chapter number : "))
     if args.end is None:
-        args.end = int(input("Enter ending chapter number : "))
+        args.end = int(ask("Enter ending chapter number : "))
     if args.comments is None:
-        response = input("Include chapter comments? [y/N] : ").strip().lower()
+        response = ask("Include chapter comments? [y/N] : ").strip().lower()
         args.comments = response in ("y", "yes")
     return args
 
@@ -1048,7 +1362,8 @@ def build_output_filename(book, chapter_epub):
     return f"{title} - {chapter_part}.epub"
 
 
-def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None):
+def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None,
+                      ask_where=False):
     toc = []
     if intro_item is not None:
         toc.append(epub.Link(intro_item.file_name, 'Introduction', 'intro'))
@@ -1064,29 +1379,50 @@ def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_i
     book.spine = ([intro_item] if intro_item is not None else []) + chapter_epub
 
     os.makedirs(output_dir, exist_ok=True)
-    save_file = asksaveasfile(
-        filetypes=[('EPUB File', '*.epub')],
-        defaultextension='.epub',
-        initialdir=output_dir,
-        initialfile=build_output_filename(book, chapter_epub),
-    )
-    if save_file is None:
-        logging.warning("Save cancelled - epub was not written.")
-        return
-    save_path = save_file.name
-    save_file.close()
+    filename = build_output_filename(book, chapter_epub)
+    if ask_where:
+        logging.info("Opening the Save As dialog (check the taskbar if you don't see it)...")
+        # A hidden always-on-top parent keeps the dialog from opening behind the
+        # terminal and the browser, which looks exactly like the script hanging.
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            save_file = asksaveasfile(
+                parent=root,
+                filetypes=[('EPUB File', '*.epub')],
+                defaultextension='.epub',
+                initialdir=output_dir,
+                initialfile=filename,
+            )
+        finally:
+            root.destroy()
+        if save_file is None:
+            logging.warning("Save cancelled - epub was not written.")
+            return
+        save_path = save_file.name
+        save_file.close()
+    else:
+        # Write straight to --output-dir; never overwrite an earlier build.
+        save_path = os.path.join(output_dir, filename)
+        base, ext = os.path.splitext(save_path)
+        n = 2
+        while os.path.exists(save_path):
+            save_path = f"{base} ({n}){ext}"
+            n += 1
     epub.write_epub(save_path, book, {})
     logging.info(f"Saved to {save_path}")
     logging.info("Enjoy your read...")
 
 
-def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None):
+def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None,
+                       ask_where=False):
     if not chapter_epub:
         logging.info("No chapters were fetched - nothing to save.")
         return
     logging.info(f"{len(chapter_epub)} chapter(s) fetched before stopping.")
     try:
-        response = input("Build the epub with the chapters fetched so far? [y/N]: ").strip().lower()
+        response = ask("Build the epub with the chapters fetched so far? [y/N]: ").strip().lower()
     except KeyboardInterrupt:
         print()
         return
@@ -1094,10 +1430,12 @@ def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_
         # No stdin to ask - default to saving rather than silently discarding
         # chapters that were already successfully fetched.
         logging.warning("No input available - saving the chapters fetched so far by default.")
-        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item)
+        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item,
+                          ask_where=ask_where)
         return
     if response in ("y", "yes"):
-        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item)
+        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item,
+                          ask_where=ask_where)
 
 
 # ---------------------------------------------------------------------------
@@ -1108,6 +1446,7 @@ def main():
     args = parse_args()
     setup_logging(getattr(logging, args.log_level))
     args = resolve_interactive(args)
+    install_sigint_handler()
     ensure_display()
 
     args.cache = PageCache(args.cache_dir, enabled=not args.no_cache)
@@ -1117,14 +1456,18 @@ def main():
                              state_path=args.session_file,
                              load_state=not args.fresh_session)
     book = epub.EpubBook()
+    css = epub.EpubItem(uid="style_book", file_name=BOOK_CSS_PATH,
+                        media_type="text/css", content=BOOK_CSS)
+    book.add_item(css)
     chapter_epub = []
     descr = None
+    exit_code = 0
 
     try:
         soup = fetch_with_retry(session, args.url, args, label="novel page")
         if soup is None:
             logging.error("Could not load the novel page. Exiting.")
-            return
+            return 1
         soup.style.decompose()
 
         # Extracting chapter count
@@ -1136,7 +1479,7 @@ def main():
                 "points to the novel's main page (with its description/genre "
                 "list and 'Start reading' button), not a link to a specific "
                 "chapter.")
-            return
+            return 1
         chapter_count_text = chapter_num.find("span", class_="grey").text
         count = int(re.findall(r'\d+', chapter_count_text)[0])
         logging.info(f"Available chapters : {count}")
@@ -1152,6 +1495,7 @@ def main():
         bar = Bar('Extracting chapter list...', max=pages)
 
         for i in range(1, pages + 1):
+            check_stop()
             page_num = index_page + f"page/{i}/"
             index_list.append(page_num)
 
@@ -1205,81 +1549,111 @@ def main():
         # Extracting introduction to novel
         descr = epub.EpubHtml(title='Introduction', file_name='intro.xhtml', lang='en')
         descr.content = build_intro_html(metadata)
+        descr.add_item(css)
         book.add_item(descr)
 
         # Extracting chapters
         args = resolve_chapter_range(args, count)
+        if len(chapter_list) != count:
+            logging.warning(
+                f"The site says {count} chapters but its index lists {len(chapter_list)}.")
+        if args.end > len(chapter_list):
+            logging.warning(f"Only {len(chapter_list)} chapters are listed; "
+                            f"ending at {len(chapter_list)} instead of {args.end}.")
+            args.end = len(chapter_list)
+        if args.start < 1 or args.start > args.end:
+            logging.error(f"Invalid chapter range {args.start}-{args.end}.")
+            return 1
         logging.info("Extracting chapters...")
 
+        skipped, special, numbers, total_words, total_removed = [], [], [], 0, 0
         i = args.start - 1
         while i < args.end:
+            check_stop()
             chapter_url = chapter_list[i]
             site_soup = fetch_with_retry(session, chapter_url, args, label=f"chapter {i + 1}")
             if site_soup is None:
                 logging.warning(f"Skipped chapter {i + 1} at user's request.")
+                skipped.append(i + 1)
                 i += 1
                 continue
 
-            # Must run BEFORE the span-strip below: the reply-to marker and
-            # online-status spans used by comment extraction live inside
-            # #dle-comments-list, which the span-strip would otherwise erase.
+            # Must run BEFORE the comments tree is removed below (comment
+            # extraction reads the reply-to marker spans that live inside it).
             comments_html = ""
             if args.comments:
                 comments = extract_comments_with_pagination(site_soup, session, args, chapter_url)
-                comments_html = build_comments_section(comments)
-            # Always strip #dle-comments-list before scanning for <p> tags below,
-            # even when comments are off - keeps chapter-text extraction (which
-            # searches the whole page, not a scoped container) safe from ever
-            # picking up stray content from inside the comments tree.
+                comments, hidden = limit_comments(comments, args.max_comments)
+                comments_html = build_comments_section(comments, hidden)
+            # Always strip #dle-comments-list before reading the chapter text,
+            # even when comments are off, so nothing from the comments tree can
+            # ever be mistaken for story text.
             comments_container = site_soup.find("div", id="dle-comments-list")
             if comments_container is not None:
                 comments_container.decompose()
 
-            for span in site_soup("span"):
-                span.decompose()
-            category_div = site_soup.find("div", class_="category grey ellipses")
-            if category_div is not None:
-                category_div.decompose()
+            chapter = build_chapter_content(site_soup, series_name, f"Chapter {i + 1}")
+            number = re.fullmatch(r"Chapter (\d+)", chapter.label)
+            if number:
+                numbers.append(int(number.group(1)))
+            else:
+                special.append((i + 1, chapter.label))
+            total_words += chapter.words
+            total_removed += chapter.removed
 
-            # Extracting chapter title
-            chapter_title = site_soup.find("h1", class_="h4 title")
-            file_name = f'ch{i + 1}.xhtml'
-            c = epub.EpubHtml(title=str(chapter_title.text.strip()), file_name=file_name)
-
-            # Extracting chapter content
-            chapter_content = site_soup.find_all("p")
-            para = '''{font}<h2 style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">
-                {title_page}</h2>'''.format(font=FONT, title_page=str(chapter_title.text.strip()))
-            for j in chapter_content:
-                para += '''{font}<p style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">{element}
-                    </p>'''.format(font=FONT, element=str(j.text.strip()))
-            if comments_html:
-                para += comments_html
-            c.content = para
+            c = epub.EpubHtml(title=chapter.label, file_name=f'ch{i + 1}.xhtml')
+            c.content = chapter.html + comments_html
+            c.add_item(css)
 
             # Adding chapters to book
             book.add_item(c)
             chapter_epub.append(c)
 
             # Printing progress on terminal
-            logging.info(chapter_title.text.strip())
+            logging.info(chapter.label)
 
             i += 1
 
-        finalize_and_save(book, chapter_epub, args.output_dir, intro_item=descr)
+        requested = args.end - args.start + 1
+        logging.info(f"Fetched {len(chapter_epub)} of {requested} requested chapters "
+                     f"({args.start}-{args.end}), about {total_words:,} words; "
+                     f"removed {total_removed} promo/duplicate lines.")
+        if skipped:
+            logging.warning(f"Skipped chapters: {', '.join(map(str, skipped))}")
+        if special:
+            logging.info("Non-chapter pages included: " +
+                         ", ".join(f"'{label}' (position {n})" for n, label in special))
+        if numbers:
+            missing = sorted(set(range(min(numbers), max(numbers) + 1)) - set(numbers))
+            duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+            if missing:
+                logging.warning("Chapter numbers missing from the fetched range: " +
+                                ", ".join(map(str, missing)))
+            if duplicates:
+                logging.warning("Chapter numbers that appear more than once: " +
+                                ", ".join(map(str, duplicates)))
+
+        finalize_and_save(book, chapter_epub, args.output_dir, intro_item=descr,
+                          ask_where=args.save_dialog)
 
     except RunAborted as e:
         logging.warning(str(e))
-        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr)
+        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr,
+                           ask_where=args.save_dialog)
+        exit_code = 1
     except KeyboardInterrupt:
         logging.info("Interrupted by user, shutting down...")
-        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr)
+        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr,
+                           ask_where=args.save_dialog)
+        exit_code = 130
     finally:
         session.close()
+    return exit_code
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         logging.info("Interrupted by user, shutting down...")
+        sys.exit(130)

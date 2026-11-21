@@ -9,7 +9,9 @@ This Python script scrapes novels from [Ranobes](https://ranobes.net/) and saves
 - 10,000+ novels to scrape
 - Terminal based and simple to use
 - Scraping progress can be monitored
-- Optionally includes each chapter's reader comments (nested replies, quotes) in the epub
+- Optionally includes each chapter's reader comments (nested replies, quotes) in the epub, capped per chapter so a busy chapter can't bury the story
+- Kindle-friendly chapters: keeps italics and bold, turns footnotes into tap-to-open notes, normalises scene breaks, strips translator-group Discord promos, and uses one shared stylesheet so your Kindle's own font and spacing settings apply
+- Prints a summary at the end (chapters fetched, any skipped or missing chapter numbers)
 - Automatically hands off to a real browser window if the site's anti-flood/CAPTCHA protection kicks in, then resumes on its own once it's solved
 - Remembers the browser's cookies between runs, so a solved CAPTCHA isn't asked for again straight away
 - Works on an Android phone (Termux) too, with a virtual display you view in a VNC app
@@ -31,7 +33,7 @@ python -m playwright install chromium
 
 The second command is a one-time download of the Chromium browser the script drives — the site can't be scraped with plain HTTP requests, since it fronts every page with a bot check that needs a real browser to clear.
 
-You also need a graphical desktop (a screen the script can open a browser window on), because the site may ask you to solve a CAPTCHA by hand — see [Anti-flood / CAPTCHA handling](#anti-flood--captcha-handling). The final "Save As" dialog needs one too. No desktop (e.g. Termux on Android)? See [Solving CAPTCHAs on Android (Termux)](#solving-captchas-on-android-termux).
+You also need a graphical desktop (a screen the script can open a browser window on), because the site may ask you to solve a CAPTCHA by hand — see [Anti-flood / CAPTCHA handling](#anti-flood--captcha-handling). No desktop (e.g. Termux on Android)? See [Solving CAPTCHAs on Android (Termux)](#solving-captchas-on-android-termux).
 
 ### Usage
 
@@ -57,7 +59,7 @@ After that, select the chapter range and it will start scraping the chapters.
 <img src = "images/Demo/chapter_range.PNG" alt = "chapter_range">
 
 
-Once done, a save dialog opens pre-filled with a sensible filename (novel title + chapter range) in the project folder — pick a different location if you'd like, or just hit Save.
+Once done, the `.epub` is written to the project folder (or `--output-dir`), named from the novel title and chapter range. An existing file is never overwritten; a number is added instead. Add `--save-dialog` if you'd rather choose the location in a Save As window.
 
 <img src = "images/Demo/save_file.PNG" alt = "save_file">
 
@@ -77,9 +79,11 @@ python main.py --help
 Run `python main.py --help` for the full list, including:
 
 - `--comments` / `--no-comments` — include reader comments per chapter (off by default)
+- `--max-comments N` — with `--comments`, show at most N comments per chapter (replies count), keeping the best-voted threads; `0` = no limit (default 20)
 - `--retries`, `--retry-delay`, `--request-delay`, `--timeout`, `--wait` — tune how patiently the script retries a failing page and how much it paces itself between requests
 - `--cache-dir`, `--no-cache` — where fetched pages are cached, or disable caching for a fully fresh run
-- `--output-dir` — where the save dialog opens by default
+- `--output-dir` — folder the `.epub` is written to (default: the project folder)
+- `--save-dialog` — pick the location in a Save As window instead (needs a desktop)
 - `--session-file`, `--fresh-session` — where cookies are kept between runs, or start one run without them
 - `--captcha-timeout`, `--no-notify` — give up on an unsolved CAPTCHA after N minutes; turn off the phone notification
 - `--log-level` — terminal verbosity
@@ -113,7 +117,7 @@ python main.py ...     # finds the display by itself
 
 When a CAPTCHA appears, open AVNC, solve it, and leave — the run continues on its own. Enable Termux's wake lock (from its notification) so Android doesn't kill it while you're in another app.
 
-If a page keeps failing after several retries for another reason (bad connection, site hiccup, etc.), the script stops and asks whether to retry, skip that item, or abort — it never silently gives up on a chapter. If you abort or interrupt the run (Ctrl+C) partway through, it'll offer to save an epub with whatever chapters were already fetched, rather than losing that work.
+If a page keeps failing after several retries for another reason (bad connection, site hiccup, etc.), the script stops and asks whether to retry, skip that item, or abort — it never silently gives up on a chapter. If you abort or interrupt the run partway through, it'll offer to save an epub with whatever chapters were already fetched, rather than losing that work. Press Ctrl+C once to stop: the run finishes the page it's on (a second or two) and then offers the save. Press Ctrl+C a second time to quit immediately without saving.
 
 
 ### Lithium: EPUB Reader

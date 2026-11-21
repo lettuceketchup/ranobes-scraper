@@ -167,7 +167,8 @@ def check_direct_save():
         book.set_title("Save Test")
         book.set_language("en")
         item = epub.EpubHtml(title="Chapter 1", file_name="ch1.xhtml")
-        item.content = "<h2>Chapter 1</h2><p>Hello.</p>"
+        item.content = ('<h2>Chapter 1</h2><p>Hello <a epub:type="noteref" href="#fn1" id="fnref1">[1]</a>.</p>'
+                        '<aside epub:type="footnote" id="fn1"><p>[1] A note.</p></aside>')
         book.add_item(item)
         return book, [item]
 
@@ -176,7 +177,10 @@ def check_direct_save():
         main.finalize_and_save(book, items, out)
     assert sorted(os.listdir(out)) == ["Save Test - Chapter 1 (2).epub",
                                        "Save Test - Chapter 1.epub"], os.listdir(out)
-    print("ok  direct save without a dialog, no overwrite")
+    # Footnote ids must not become a hidden page-list of fake page numbers.
+    with zipfile.ZipFile(os.path.join(out, "Save Test - Chapter 1.epub")) as z:
+        assert b"page-list" not in z.read("EPUB/nav.xhtml")
+    print("ok  direct save without a dialog, no overwrite, no fake page-list")
 
 
 def cached_chapters():
@@ -271,7 +275,7 @@ def check_epub_build(out_dir):
     book.spine = [intro] + items
 
     path = os.path.join(out_dir, "test-book.epub")
-    epub.write_epub(path, book, {})
+    epub.write_epub(path, book, {"epub3_pages": False})
 
     with zipfile.ZipFile(path) as z:
         names = z.namelist()

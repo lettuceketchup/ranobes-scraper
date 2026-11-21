@@ -1410,7 +1410,10 @@ def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_i
         while os.path.exists(save_path):
             save_path = f"{base} ({n}){ext}"
             n += 1
-    epub.write_epub(save_path, book, {})
+    # epub3_pages off: ebooklib otherwise turns every element id (our footnote
+    # anchors) into a hidden "page-list" of fake page numbers, which Kindle can
+    # show as real page labels.
+    epub.write_epub(save_path, book, {"epub3_pages": False})
     logging.info(f"Saved to {save_path}")
     logging.info("Enjoy your read...")
 

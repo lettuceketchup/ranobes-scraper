@@ -1,1 +1,3 @@
 .page_cache/
+.browser_state.json
+.browser_state.json.tmp

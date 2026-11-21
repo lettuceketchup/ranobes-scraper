@@ -3,10 +3,13 @@ import argparse
 import ast
 import hashlib
 import io
+import json
 import logging
 import math
 import os
 import re
+import select
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -38,11 +41,24 @@ CAPTCHA_MARKERS = (
     "verify you are human",
 )
 
+# Virtual display started by display.sh (Xvfb :1, viewed over VNC). main.py
+# points DISPLAY at it automatically when it's running and DISPLAY is unset.
+VIRTUAL_DISPLAY = ":1"
+VIRTUAL_DISPLAY_SOCKET = "/tmp/.X11-unix/X1"
+
+# How often the CAPTCHA wait loop re-checks the page, and how many clear checks
+# in a row count as solved (one clear read can be a page mid-navigation).
+CAPTCHA_POLL_SECONDS = 3
+CAPTCHA_CLEAR_CHECKS = 2
+CAPTCHA_NOTIFICATION_ID = "ranobes-captcha"
+
 MAX_COMMENT_INDENT_DEPTH = 5
 COMMENT_PAGE_SAFETY_CAP = 50
 
 DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".page_cache")
 DEFAULT_OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    ".browser_state.json")
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -184,19 +200,64 @@ class BrowserSession:
     # image CAPTCHA ("click on the similar image") on the very first request,
     # which only a human in a visible window can solve (see handle_anti_flood).
 
-    def __init__(self, timeout_ms=30000, wait_ms=1500):
+    def __init__(self, timeout_ms=30000, wait_ms=1500, state_path=None,
+                 load_state=True):
         self.timeout_ms = timeout_ms
         self.wait_ms = wait_ms
+        # Cookies (incl. the site's CAPTCHA clearance) are saved to state_path
+        # and reloaded on the next run, so a solved CAPTCHA isn't forgotten as
+        # soon as the process exits. None disables saving entirely.
+        self.state_path = state_path
+        self._last_state = self._load_state() if (state_path and load_state) else None
         self.playwright = sync_playwright().start()
         self.browser = None
         self.context = None
         self.page = None
-        self._launch(headless=True)
+        self._launch(headless=True, storage_state=self._last_state)
+
+    def _load_state(self):
+        if not os.path.exists(self.state_path):
+            logging.info("No saved browser session yet - starting with no cookies.")
+            return None
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+                raise ValueError("unexpected format")
+        except (OSError, ValueError) as e:
+            logging.warning(f"Ignoring unreadable saved browser session "
+                            f"{self.state_path} ({e}) - starting with no cookies.")
+            return None
+        logging.info(f"Loaded saved browser session ({len(state['cookies'])} "
+                     f"cookie(s)) from {self.state_path}")
+        return state
+
+    def save_state(self):
+        """Snapshot the current cookies to memory and (if enabled) to disk.
+        Never raises - losing a snapshot must not break the run."""
+        state = self._snapshot()
+        if state is None or not self.state_path:
+            return
+        tmp = f"{self.state_path}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.state_path)
+            logging.debug(f"Saved browser session to {self.state_path}")
+        except OSError as e:
+            logging.warning(f"Could not save browser session to {self.state_path}: {e}")
 
     def _launch(self, headless, storage_state=None):
-        self.browser = self.playwright.chromium.launch(headless=headless)
+        # A visible (CAPTCHA) window is maximized and sized to the window, not
+        # a fixed viewport, so the challenge fills the (VNC) screen and stays
+        # big enough to tap/drag accurately on a phone.
+        self.browser = self.playwright.chromium.launch(
+            headless=headless, args=[] if headless else ["--start-maximized"])
         self.context = self.browser.new_context(
-            user_agent=USER_AGENT, storage_state=storage_state)
+            user_agent=USER_AGENT, storage_state=storage_state,
+            **({} if headless else {"no_viewport": True}))
         self.page = self.context.new_page()
 
     def fetch_soup(self, url):
@@ -216,9 +277,29 @@ class BrowserSession:
             raise PlaywrightError(f"HTTP {response.status} fetching {url}")
         return response.body()
 
+    def _snapshot(self):
+        """Current cookies, remembered in self._last_state. Falls back to the
+        last good snapshot if the browser is already gone (e.g. a human closed
+        the CAPTCHA window), so swapping browsers never loses the session."""
+        try:
+            self._last_state = self.context.storage_state()
+        except PlaywrightError as e:
+            logging.debug(f"Could not read browser session state: {e}")
+        return self._last_state
+
+    def _close_browser(self):
+        try:
+            self.browser.close()
+        except PlaywrightError:
+            pass
+
     def switch_to_headed(self, url):
-        state = self.context.storage_state()
-        self.browser.close()
+        """Swap to a visible browser on `url`. Raises PlaywrightError only if
+        the window can't be launched at all; a failed navigation (e.g. the
+        network dropped) is returned as a message instead, because the window
+        is up and a human can simply reload once the connection is back."""
+        state = self._snapshot()
+        self._close_browser()
         try:
             self._launch(headless=False, storage_state=state)
         except PlaywrightError:
@@ -227,20 +308,32 @@ class BrowserSession:
             # still has a browser to shut down, then let the caller decide.
             self._launch(headless=True, storage_state=state)
             raise
-        self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        except PlaywrightError as e:
+            return classify_exception(e)
         try:
             self.page.bring_to_front()
         except PlaywrightError:
             pass
+        return None
 
     def switch_to_headless(self):
-        state = self.context.storage_state()
-        self.browser.close()
+        state = self._snapshot()
+        self._close_browser()
         self._launch(headless=True, storage_state=state)
+
+    def window_closed(self):
+        return not self.browser.is_connected() or self.page.is_closed()
 
     def close(self):
         if self.browser is not None:
-            self.browser.close()
+            if self.browser.is_connected():
+                self.save_state()
+            try:
+                self.browser.close()
+            except PlaywrightError:
+                pass
         self.playwright.stop()
 
 
@@ -293,38 +386,151 @@ def headed_launch_failure_message(e):
     else:
         reason = f"the browser failed to launch: {str(e).splitlines()[0]}"
     return ("The site wants a human to solve a verification, but a visible browser "
-            f"window couldn't be opened - {reason}. Re-run on a machine with a "
-            "display (or set one up here) to solve it.")
+            f"window couldn't be opened - {reason}. Start the virtual display "
+            "(./display.sh start) or re-run on a machine with a display, then "
+            "re-run to solve it.")
 
 
-def handle_anti_flood(session, blocked_url):
-    logging.warning("Anti-flood protection triggered by the site.")
-    print(f"If a browser window doesn't appear, open this URL manually: {blocked_url}")
+def ensure_display():
+    """Point DISPLAY at display.sh's virtual screen if it's running and no
+    display is set, so CAPTCHA windows open there without manual exports."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    if os.path.exists(VIRTUAL_DISPLAY_SOCKET):
+        os.environ["DISPLAY"] = VIRTUAL_DISPLAY
+        logging.info(f"Using the virtual display {VIRTUAL_DISPLAY} for CAPTCHA "
+                     "windows (view it in your VNC app).")
+    else:
+        logging.info("No display found. If the site asks for a CAPTCHA the run "
+                     "will have to stop - start one first with ./display.sh start")
+
+
+def notify(title, text, enabled=True):
+    """Alert a human: terminal bell, plus an Android notification through
+    Termux:API when available. Never raises."""
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+    if not enabled:
+        return
+    exe = shutil.which("termux-notification")
+    if exe is None:
+        logging.debug("termux-notification not found - terminal bell only.")
+        return
     try:
-        session.switch_to_headed(blocked_url)
+        subprocess.run([exe, "--id", CAPTCHA_NOTIFICATION_ID, "--title", title,
+                        "--content", text, "--priority", "high",
+                        "--vibrate", "300,200,300"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.debug(f"Could not send a notification: {e}")
+
+
+def clear_notification(enabled=True):
+    exe = shutil.which("termux-notification-remove") if enabled else None
+    if exe is None:
+        return
+    try:
+        subprocess.run([exe, CAPTCHA_NOTIFICATION_ID], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.debug(f"Could not remove the notification: {e}")
+
+
+_STDIN_EOF = object()
+
+
+def read_line_with_timeout(seconds):
+    """A line typed on stdin within `seconds`, None if nothing was typed, or
+    _STDIN_EOF if stdin is closed."""
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], seconds)
+    except (OSError, ValueError):
+        # stdin isn't selectable (unusual) - just wait out the poll interval.
+        time.sleep(seconds)
+        return None
+    if not ready:
+        return None
+    line = sys.stdin.readline()
+    return _STDIN_EOF if line == "" else line
+
+
+def captcha_page_state(session):
+    """'blocked', 'clear', or 'unknown' (page closed, blank, a browser error
+    page, or unreadable mid-navigation)."""
+    page = session.page
+    if page.is_closed():
+        return "unknown"
+    try:
+        # Ask the page itself: Playwright's page.url stays "about:blank" after
+        # a failed goto() even once a human reloads the real page in the window.
+        url = page.evaluate("location.href")
+        if url == "about:blank" or url.startswith("chrome-error://"):
+            return "unknown"
+        soup = BeautifulSoup(safe_page_content(page, attempts=2), "html.parser")
+    except PlaywrightError:
+        return "unknown"
+    return "blocked" if is_anti_flood_blocked(soup) else "clear"
+
+
+def wait_for_captcha_cleared(session, captcha_timeout=None):
+    """Poll the visible window until the challenge is gone, so the run resumes
+    on its own. Enter checks right away; 'abort' gives up. Raises RunAborted
+    on abort, closed stdin, a closed window, or --captcha-timeout."""
+    deadline = (time.monotonic() + captcha_timeout * 60) if captcha_timeout else None
+    clear_streak = 0
+    while True:
+        if session.window_closed():
+            raise RunAborted("The CAPTCHA window was closed")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RunAborted(f"The CAPTCHA wasn't solved within --captcha-timeout "
+                             f"({captcha_timeout:g} min)")
+        line = read_line_with_timeout(CAPTCHA_POLL_SECONDS)
+        if line is _STDIN_EOF:
+            raise RunAborted("Aborted during anti-flood verification (no input available)")
+        manual = line is not None
+        if manual and line.strip().lower() == "abort":
+            raise RunAborted("Aborted during anti-flood verification")
+        if session.window_closed():
+            raise RunAborted("The CAPTCHA window was closed")
+        state = captcha_page_state(session)
+        if state == "clear":
+            clear_streak += 1
+            if manual or clear_streak >= CAPTCHA_CLEAR_CHECKS:
+                return
+            continue
+        clear_streak = 0
+        if manual:
+            if state == "blocked":
+                logging.warning("Still blocked - please complete the verification.")
+            else:
+                logging.warning("The page isn't readable yet (loading, or a "
+                                "network error page - reload it in the window).")
+
+
+def handle_anti_flood(session, blocked_url, args):
+    logging.warning("Anti-flood protection triggered by the site.")
+    try:
+        nav_error = session.switch_to_headed(blocked_url)
     except PlaywrightError as e:
         raise RunAborted(headed_launch_failure_message(e)) from None
+    notify_on = not args.no_notify
     try:
-        while True:
-            response = safe_input(
-                "Solve the verification in the browser window, then press Enter "
-                "to continue (or type 'abort'): ")
-            if response is None:
-                logging.error("No input available - aborting.")
-                raise RunAborted("Aborted during anti-flood verification (no input available)")
-            if response.strip().lower() == "abort":
-                raise RunAborted("Aborted during anti-flood verification")
-            try:
-                soup = BeautifulSoup(safe_page_content(session.page), "html.parser")
-            except PlaywrightError as e:
-                logging.warning(f"Could not read the page yet ({classify_exception(e)}) - "
-                                 "checking again.")
-                continue
-            if not is_anti_flood_blocked(soup):
-                logging.info("Verification cleared, resuming...")
-                return
-            logging.warning("Still blocked - please complete the verification.")
+        where = os.environ.get("DISPLAY") or "the screen"
+        print(f"A CAPTCHA window is open on display {where} - solve it there "
+              "(e.g. in your VNC app). The run resumes by itself once it's "
+              "cleared; type 'abort' + Enter to give up.")
+        if nav_error:
+            logging.warning(f"The CAPTCHA page didn't load ({nav_error}). Reload "
+                            "it in the window once the connection is back.")
+        notify("ranobes-scraper: CAPTCHA",
+               "Solve it in your VNC app - the run resumes by itself.", notify_on)
+        wait_for_captcha_cleared(session, args.captcha_timeout)
+        logging.info("Verification cleared, resuming...")
+        session.save_state()
     finally:
+        clear_notification(notify_on)
         session.switch_to_headless()
 
 
@@ -378,7 +584,7 @@ def fetch_with_retry(session, url, args, *, label, progress_bar=None):
 
         if is_anti_flood_blocked(soup):
             log_line(f"{label}: anti-flood protection triggered.", progress_bar, logging.WARNING)
-            handle_anti_flood(session, url)
+            handle_anti_flood(session, url, args)
             continue
 
         if args.request_delay:
@@ -778,6 +984,25 @@ def parse_args():
              "is also recorded as the volume/series index. Off by default, since "
              "Kindle itself does not auto-group personal documents by series.")
     parser.add_argument(
+        "--session-file", default=DEFAULT_SESSION_FILE,
+        help="File the browser's cookies are saved to at the end of a run and "
+             "after a CAPTCHA is solved, and loaded from at the start of the "
+             "next run, so a solved CAPTCHA isn't asked for again straight away. "
+             f"Holds login-like cookies; keep it private (default: {DEFAULT_SESSION_FILE})")
+    parser.add_argument(
+        "--fresh-session", action="store_true",
+        help="Start this run with no saved cookies (the session file is still "
+             "overwritten with this run's cookies at the end)")
+    parser.add_argument(
+        "--no-notify", action="store_true",
+        help="Don't send an Android notification (via Termux:API) when a "
+             "CAPTCHA needs solving; only ring the terminal bell")
+    parser.add_argument(
+        "--captcha-timeout", type=float, default=None, metavar="MINUTES",
+        help="Give up (and offer to save the chapters fetched so far) if a "
+             "CAPTCHA isn't solved within this many minutes (default: wait "
+             "indefinitely)")
+    parser.add_argument(
         "--output-dir", default=DEFAULT_OUTPUT_DIR,
         help="Directory the save dialog opens in by default, pre-filled with "
              f"a name based on the novel title and chapter range (default: "
@@ -883,11 +1108,14 @@ def main():
     args = parse_args()
     setup_logging(getattr(logging, args.log_level))
     args = resolve_interactive(args)
+    ensure_display()
 
     args.cache = PageCache(args.cache_dir, enabled=not args.no_cache)
     logging.info(f"Page cache: {'disabled (--no-cache)' if args.no_cache else args.cache_dir}")
 
-    session = BrowserSession(timeout_ms=args.timeout, wait_ms=args.wait)
+    session = BrowserSession(timeout_ms=args.timeout, wait_ms=args.wait,
+                             state_path=args.session_file,
+                             load_state=not args.fresh_session)
     book = epub.EpubBook()
     chapter_epub = []
     descr = None
